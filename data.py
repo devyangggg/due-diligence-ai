@@ -5,7 +5,7 @@ import re
 from bs4 import BeautifulSoup as bs
 
 
-def getVitals(ticker:str):
+def getVitals(ticker:str) -> dict:
     data = fin.download(ticker, period="1y")["Close"][ticker]
 
     df = pd.DataFrame(data)
@@ -20,7 +20,8 @@ def getVitals(ticker:str):
         "sector": ticker_apple['sector'], 
         "marketCap": ticker_apple['marketCap'],
         "priceHist": df['Price'],
-        "dailyReturns": df['Returns']
+        "dailyReturns": df['Returns'],
+        'beta':ticker_apple['beta']
         }
     return comp_info
 
@@ -102,5 +103,3 @@ def get_latest_10k(ticker:str):
     main_text = text[start:]
     return main_text
 
-    
-print(get_latest_10k("MSFT"))
