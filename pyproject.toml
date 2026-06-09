@@ -6,6 +6,13 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "beautifulsoup4>=4.14.3",
+    "dotenv>=0.9.9",
+    "groq>=1.4.0",
     "langgraph>=1.2.4",
     "yfinance>=1.4.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
 ]

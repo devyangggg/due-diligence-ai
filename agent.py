@@ -2,7 +2,15 @@ from typing import TypedDict
 import data
 import yfinance as fin
 from langgraph.graph import StateGraph, START, END
+from dotenv import load_dotenv
+import os
+from groq import Groq
 
+load_dotenv()
+
+api_key = os.getenv("GROQ_API_KEY")
+
+model = Groq(api_key=api_key)
 
 class AgentState(TypedDict):
     ticker: str
@@ -65,8 +73,6 @@ def synth_agent(state:AgentState):
 
 graph = StateGraph(AgentState)
 
-#define model here 
-
 graph.add_node("fundamentals_agent",fundamentals_agent)
 graph.add_node("risk_agent",risk_agent)
 graph.add_node("info_agent",info_agent)
@@ -85,6 +91,7 @@ graph.add_edge("synth_agent", END)
 
 app = graph.compile()
 
-result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
-print(result['final_output'])
+# result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
+# print(result['final_output'])
+
 
