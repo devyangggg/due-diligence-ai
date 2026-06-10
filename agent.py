@@ -5,6 +5,7 @@ from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 import os
 from groq import Groq
+import pandas as pd
 
 load_dotenv()
 
@@ -36,15 +37,18 @@ def fundamentals_agent(state:AgentState):
 
 def risk_agent(state:AgentState):
     fundam = state['fundamentals']
-    volatility = fundam['dailyReturns'].std()
+    price_hist = pd.Series(fundam['priceHist'])  # convert list back to series so pandas math methods work
+    daily_returns = pd.Series(fundam['dailyReturns'])
+
+    volatility = daily_returns.std()
     beta = fundam['beta']
-    rolling_max = fundam['priceHist'].expanding().max()
-    drawdown = (fundam['priceHist'] - rolling_max) / rolling_max
-    max_drawdown = drawdown.min()
+    rolling_max = price_hist.expanding().max()
+    drawdown = (price_hist - rolling_max) / rolling_max
+    max_drawdown = float(drawdown.min())
 
     return {
         "risk_info":{
-            "volatility" : volatility,
+            "volatility" : float(volatility),
             "beta": beta,
             "max_drawdown" : max_drawdown
         }
@@ -53,10 +57,10 @@ def risk_agent(state:AgentState):
 
 def info_agent(state:AgentState):
     ticker = state['ticker']
-    insider_trans = fin.Ticker(ticker).insider_transactions
+    insider_trans = fin.Ticker(ticker).insider_transactions.astype(str)
     return {
         "info_collected":{
-            "insider_trans" : insider_trans
+            "insider_trans" : insider_trans.to_dict(orient='records')
         }
     }
 
@@ -74,10 +78,26 @@ def synth_agent(state:AgentState):
     10-K Extract: {state['fundamentals']['ten_k'][:3000]}
     """
 
+    system_prompt = """
+    You are a senior financial analyst at a PE firm. You are concise, direct, and data-driven. No filler sentences.
+
+    Given company data, produce a due diligence brief in exactly this structure:
+
+    1. Company Snapshot — ticker, sector, key metrics formatted correctly (P/E as ratio, volatility as %, drawdown as %)
+    2. Financial Analysis — what the numbers indicate about the company's health
+    3. Risk Assessment — beta, volatility, drawdown interpreted in context
+    4. Insider Activity — what the trading patterns suggest
+    5. Bull Case — 2-3 specific reasons to invest
+    6. Bear Case — 2-3 specific reasons to avoid
+    7. Recommendation — Buy / Hold / Sell with one sentence justification
+
+    If the 10-K extract is insufficient to draw conclusions, say so explicitly. Do not fabricate insights.
+    """
+
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": "You are a senior financial analyst at a PE firm. You are given with the vital company information, risk factors, financial records, insider trading records etc. Your job is to take all this information in, process this and turn it into a well formatted financial report for investment purposes"},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
     )
@@ -112,6 +132,5 @@ graph.add_edge("synth_agent", END)
 
 app = graph.compile()
 
-result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
-print(result['final_output'])
+#result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
 

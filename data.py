@@ -19,8 +19,8 @@ def getVitals(ticker:str) -> dict:
         "peRatio": ticker_apple['trailingPE'], 
         "sector": ticker_apple['sector'], 
         "marketCap": ticker_apple['marketCap'],
-        "priceHist": df['Price'],
-        "dailyReturns": df['Returns'],
+        "priceHist": df['Price'].to_list(),
+        "dailyReturns": df['Returns'].to_list(),
         'beta':ticker_apple['beta']
         }
     return comp_info
