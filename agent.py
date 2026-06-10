@@ -10,7 +10,7 @@ load_dotenv()
 
 api_key = os.getenv("GROQ_API_KEY")
 
-model = Groq(api_key=api_key)
+client = Groq(api_key=api_key)
 
 class AgentState(TypedDict):
     ticker: str
@@ -63,8 +63,29 @@ def info_agent(state:AgentState):
 def synth_agent(state:AgentState):
     """Make a summary kind of something from the data in the state and write to final_output"""
 
+    user_prompt = f"""
+    Ticker: {state['ticker']}
+    Sector: {state['fundamentals']['sector']}
+    P/E Ratio: {state['fundamentals']['peRatio']}
+    Beta: {state['risk_info']['beta']}
+    Volatility: {state['risk_info']['volatility']}
+    Max Drawdown: {state['risk_info']['max_drawdown']}
+    Insider Transactions: {state['info_collected']['insider_trans']}
+    10-K Extract: {state['fundamentals']['ten_k'][:3000]}
+    """
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a senior financial analyst at a PE firm. You are given with the vital company information, risk factors, financial records, insider trading records etc. Your job is to take all this information in, process this and turn it into a well formatted financial report for investment purposes"},
+            {"role": "user", "content": user_prompt}
+        ]
+    )
+
+    #result = response.choices[0].message.content
+
     return {
-    "final_output": f"Ticker: {state['ticker']} | Sector: {state['fundamentals']['sector']} | Beta: {state['risk_info']['beta']}"
+    "final_output": response.choices[0].message.content
     }
 
 # test_state = {"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""}
@@ -91,7 +112,6 @@ graph.add_edge("synth_agent", END)
 
 app = graph.compile()
 
-# result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
-# print(result['final_output'])
-
+result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
+print(result['final_output'])
 

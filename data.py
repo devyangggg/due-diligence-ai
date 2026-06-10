@@ -57,11 +57,11 @@ def get_latest_10k(ticker:str):
     data = res.json()
 
     # python 3.15 safety
-    data['Date'] = pd.to_datetime(data['Date'], format='%Y-%m-%d', errors='coerce')
+    #data['Date'] = pd.to_datetime(data['filings']['recent'][''], format='%Y-%m-%d', errors='coerce')
 
     df = pd.DataFrame({
         'form' : data['filings']['recent']['form'],
-        'rep_date' : data['data'],
+        # 'rep_date' : data['data'],
         'accession_num' : data['filings']['recent']['accessionNumber'],
         'filing_date' : data['filings']['recent']['filingDate']
     })
