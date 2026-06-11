@@ -106,3 +106,60 @@ def get_latest_10k(ticker:str):
     main_text = text[start:]
     return main_text
 
+
+def slice_10k_specific_items(text):
+    sections = {}
+    
+    # Step 1: Force the parsing engine to start after the Table of Contents.
+    # "PART I" followed closely by "Item 1" marks the start of the actual document body.
+    body_start_idx = text.find("PART I")
+    if body_start_idx == -1:
+        body_start_idx = text.lower().find("part i")
+        
+    if body_start_idx == -1:
+        # Fallback to absolute start if "PART I" header is missing
+        body_start_idx = 0
+    
+    body_text = text[body_start_idx:]
+    
+    # Step 2: Define the target items and their exact sequential content anchors.
+    # Note: We use variations with and without punctuation to increase match reliability.
+    targets = [
+        {"name": "Item 1", "anchors": ["Item 1. Business", "Item 1.  Business", "Item 1.\xa0\xa0\xa0\xa0Business"]},
+        {"name": "Item 1A", "anchors": ["Item 1A. Risk Factors", "Item 1A.  Risk Factors", "Item 1A.\xa0\xa0\xa0\xa0Risk Factors"]},
+        {"name": "Item 7", "anchors": ["Item 7. Management’s Discussion", "Item 7. Management's Discussion", "Item 7.\xa0\xa0\xa0\xa0Management’s"]},
+        {"name": "Item 8", "anchors": ["Item 8. Financial Statements", "Item 8.  Financial Statements", "Item 8.\xa0\xa0\xa0\xa0Financial"]},
+        # We need an end anchor for Item 8 so it doesn't grab the rest of the 10-K (Part IV, Signatures, etc.)
+        {"name": "Item 9", "anchors": ["Item 9. Changes in", "Item 9.  Changes", "Item 9.\xa0\xa0\xa0\xa0Changes"]}
+    ]
+    
+    # Step 3: Find the starting character index for each target item in the body text
+    for target in targets:
+        target["start_idx"] = -1
+        for anchor in target["anchors"]:
+            idx = body_text.find(anchor)
+            if idx != -1:
+                target["start_idx"] = idx
+                break  # Stop searching once a valid variation is matched
+
+    # Step 4: Slice the text between sequential pairs
+    for i in range(len(targets) - 1):  # Loop up to Item 8 (ignoring Item 9's block itself)
+        current_item = targets[i]
+        next_item = targets[i+1]
+        
+        start = current_item["start_idx"]
+        end = next_item["start_idx"]
+        
+        # If the current item isn't found, skip it
+        if start == -1:
+            print(f"Warning: Could not locate content body for {current_item['name']}")
+            continue
+            
+        # If the next item is found, slice up to its beginning. 
+        # If it's not found, grab text up to the end of the available document.
+        if end != -1 and end > start:
+            sections[current_item["name"]] = body_text[start:end].strip()
+        else:
+            sections[current_item["name"]] = body_text[start:].strip()
+            
+    return sections
