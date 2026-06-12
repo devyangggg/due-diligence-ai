@@ -214,6 +214,6 @@ graph.add_edge("synth_agent", END)
 
 app = graph.compile()
 
-result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
+# result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
 
-print(result.keys())
+# print(result['final_output'])
