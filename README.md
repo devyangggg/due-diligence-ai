@@ -50,7 +50,7 @@ cd frontend && npm run build
 | Historical graph, 21 runs | No cache | 14.301 ms | 16.262 ms |
 | Current graph, 21 runs | 1 cold + 20 warm SQLite runs | 9.048 ms | 9.531 ms |
 
-The median is the middle of 21 runs; p95 is the 20th-fastest run. **Do not interpret the lower current mock times as a production speedup:** the old graph is always uncached, the new graph is mostly warm, the generated response formats differ, and real network/model delays are replaced by fixed fake delays. No real-world speedup or roughly 30-minute manual baseline has been measured. An earlier four-question synthetic retrieval check found the expected passage first in 4/4 invented cases; that is not real-filing accuracy. The Next.js dashboard was previously opened with a fake-backed FastAPI server: it displayed a cited brief and restored it from backend history after reload.
+The median is the middle of 21 runs; p95 is the 20th-fastest run. **Do not interpret the lower current mock times as a production speedup:** the old graph is always uncached, the new graph is mostly warm, the generated response formats differ, and real network/model delays are replaced by fixed fake delays. Actual OpenRouter request timings, usage, and cost are reported separately below and cannot be compared to these simulated milliseconds. No real-world speedup or roughly 30-minute manual baseline has been measured. An earlier four-question synthetic retrieval check found the expected passage first in 4/4 invented cases; that is not real-filing accuracy. The Next.js dashboard was previously opened with a fake-backed FastAPI server: it displayed a cited brief and restored it from backend history after reload.
 
 In a separate SEC-only smoke check, the 2026 Apple 10-K yielded four sections and 93 indexed passages. The focused Item 8 queries selected five distinct passages containing net-income, net-sales, and balance-sheet text; the selection was inspected with a fake model client, not a generated live brief. This demonstrates context coverage on one filing, not citation accuracy or model answer quality.
 
@@ -86,16 +86,31 @@ A separate diagnostic AAPL WebSocket run replaced only Yahoo fundamentals and in
 
 After switching all Yahoo Finance calls to a shared Firefox-impersonating session, a fully live AAPL WebSocket run completed using Yahoo prices, fundamentals, and insider transactions, the SEC filing, local passage retrieval, and OpenRouter generation. It took 76.8 seconds in this single local run; the completed brief had 19 citation records and 8,148 characters. `GET /runs/{id}` returned the completed run while the temporary test database existed. This is an integration smoke result, not a model factual-accuracy assessment or a representative latency benchmark.
 
-### Two-filing live evaluation
+### Live OpenRouter evaluations
 
-In one sequential run against real Yahoo Finance, SEC filings, and OpenRouter with a fresh temporary SQLite database, both WebSocket analyses completed and `GET /runs/{id}` returned each completed record. Times are wall-clock measurements of these individual requests, **not** a latency distribution or a comparison with the offline mock benchmark.
+Two analyses (AAPL and META) ran sequentially with a temporary SQLite database; a separate MSFT run instrumented the five actual OpenRouter requests. All three used real Yahoo Finance, SEC filings, local retrieval, and OpenRouter. Each completed through the WebSocket, and `GET /runs/{id}` returned its completed record before the temporary database was removed. Times are wall-clock measurements of individual runs, **not** a latency distribution or a comparison with the offline mock benchmark.
 
 | Ticker | WebSocket duration | Claims with filing citations / all claims | Source links resolving to saved excerpts | Run |
 | --- | ---: | ---: | ---: | --- |
 | AAPL | 37.889 s | 25 / 36 | 30 / 30 | Completed, HTTP 200 on history lookup |
 | META | 28.063 s | 18 / 29 | 20 / 20 | Completed, HTTP 200 on history lookup |
+| MSFT | 41.961 s | 24 / 32 | 26 / 26 | Completed, HTTP 200 on history lookup |
+
+#### Actual OpenRouter requests in the MSFT run
+
+| Request | Latency | Input tokens | Output tokens | OpenRouter-reported cost |
+| --- | ---: | ---: | ---: | ---: |
+| Item 1 extraction | 4.786 s | 2,699 | 349 | $0.00013236 |
+| Item 1A extraction | 4.990 s | 2,055 | 352 | $0.00011373 |
+| Item 7 extraction | 6.113 s | 2,787 | 436 | $0.00014805 |
+| Item 8 extraction | 5.991 s | 2,413 | 458 | $0.00014037 |
+| Final synthesis | 19.654 s | 3,201 | 2,004 | $0.00039591 |
+
+All five real requests finished successfully with strict JSON Schema. OpenRouter reported **13,155 input tokens, 3,599 output tokens, and $0.00093042 total** for this MSFT run. The four section requests overlap under bounded concurrency, so adding their latencies does not yield the 41.961-second end-to-end duration, which also includes SEC, Yahoo, local embeddings, and storage. These are single-run observations, not a provider latency or cost distribution.
 
 Source links resolve to allowed passage IDs, but **the generated claims are not reliably grounded**. In a manual spot-check, an Apple claim called $67,656 million the company's operating income, although its cited Item 8 table lists that as one segment and $123,216 million as the table total. Another Apple claim called $12,815 million lease liabilities; its cited table calls that right-of-use *assets* and lists $14,368 million of lease liabilities. A Meta claim described accelerating Reality Labs hardware adoption, but its cited excerpt describes sales efforts without an adoption trend. These examples demonstrate unsupported or misread claims, not an exhaustive error count or an accuracy percentage. Review any generated financial statement against the filing before use; valid citation IDs alone do not make it correct.
+
+The MSFT run also cited an Item 7 passage about tax rates for a 27% Microsoft Cloud revenue-growth claim; that passage contains no cloud revenue figure. Three completed runs demonstrate API integration, not generated-answer accuracy.
 
 ## Limits
 
