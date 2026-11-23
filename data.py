@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import cache
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -16,6 +17,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 import httpx
 import pandas as pd
 import yfinance as fin
+from curl_cffi import requests as curl_requests
 
 
 @dataclass(frozen=True)
@@ -34,14 +36,20 @@ class Filing:
     sections: dict[str, str]
 
 
+@cache
+def yahoo_session() -> curl_requests.Session:
+    # yfinance shares cookies and crumb state across its Yahoo requests.
+    return curl_requests.Session(impersonate="firefox")
+
+
 def getVitals(ticker: str) -> dict:
-    data = fin.download(ticker, period="1y")["Close"][ticker]
+    data = fin.download(ticker, period="1y", session=yahoo_session())["Close"][ticker]
 
     df = pd.DataFrame(data)
     df.columns = ["Price"]
     df["Returns"] = df["Price"].pct_change() * 100
     df = df.dropna()
-    t_info = fin.Ticker(ticker)
+    t_info = fin.Ticker(ticker, session=yahoo_session())
     ticker_apple = t_info.info
 
     comp_info = {

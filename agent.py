@@ -10,7 +10,7 @@ from statistics import stdev
 from typing import Any, TypedDict
 
 import yfinance as fin
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from langgraph.graph import END, START, StateGraph
 from langchain_core.runnables import RunnableConfig
 
@@ -43,7 +43,30 @@ SECTIONS = {
         "What cash, assets, liabilities, or debt appear on the balance sheet?",
     ),
 }
-GROQ_MODEL = "openai/gpt-oss-120b"
+OPENROUTER_MODEL = "openai/gpt-oss-120b"
+OPENROUTER_ROUTE = {
+    "provider": {
+        "require_parameters": True,
+        "allow_fallbacks": False,
+        "data_collection": "deny",
+    },
+}
+
+
+def _claim_schema(allowed: set[str]) -> dict[str, Any]:
+    citation = (
+        {"type": "string", "enum": sorted(allowed)}
+        if allowed else {"type": "string"}
+    )
+    return {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "citations": {"type": "array", "items": citation},
+        },
+        "required": ["text", "citations"],
+        "additionalProperties": False,
+    }
 
 
 @dataclass
@@ -51,7 +74,7 @@ class AnalysisContext:
     sec: data.SECClient
     store: Store
     embedder: LocalEmbedder
-    groq: AsyncGroq | None
+    llm: AsyncOpenAI | None
     executor: ThreadPoolExecutor
     model_limit: asyncio.Semaphore
     index_locks: tuple[asyncio.Lock, ...]
@@ -169,10 +192,27 @@ async def summary_agent(state: AgentState, config: RunnableConfig) -> dict:
         allowed = set(selected)
         evidence = "\n\n".join(f"[{passage.id}] {passage.text}" for passage in selected.values())
         async with ctx.model_limit:
-            response = await ctx.groq.chat.completions.create(
-                model=GROQ_MODEL,
+            response = await ctx.llm.chat.completions.create(
+                model=OPENROUTER_MODEL,
                 timeout=60,
-                response_format={"type": "json_object"},
+                max_tokens=2048,
+                reasoning_effort="low",
+                extra_body=OPENROUTER_ROUTE,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "filing_claims",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "claims": {"type": "array", "items": _claim_schema(allowed)},
+                            },
+                            "required": ["claims"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
                 messages=[
                     {"role": "system", "content": (
                         "You extract facts ONLY from the supplied 10-K passages. Return a JSON object "
@@ -216,7 +256,7 @@ async def risk_agent(state: AgentState) -> dict:
 
 
 def _insider_transactions(ticker: str) -> list[dict]:
-    table = fin.Ticker(ticker).insider_transactions
+    table = fin.Ticker(ticker, session=data.yahoo_session()).insider_transactions
     if table is None or table.empty:
         return []
     return table.astype(str).head(20).to_dict(orient="records")
@@ -271,6 +311,7 @@ async def synth_agent(state: AgentState, config: RunnableConfig) -> dict:
     claims = state["summary_claims"]
     used_ids = {id_ for claim in claims for id_ in claim["citations"]}
     evidence = {passage.id: passage for passage in state["passages"] if passage.id in used_ids}
+    citation_schema = _claim_schema(set(evidence))
     prompt = {
         "ticker": state["ticker"],
         "sector": fundam["sector"],
@@ -281,10 +322,41 @@ async def synth_agent(state: AgentState, config: RunnableConfig) -> dict:
         "filing_claims": claims,
     }
     async with ctx.model_limit:
-        response = await ctx.groq.chat.completions.create(
-            model=GROQ_MODEL,
+        response = await ctx.llm.chat.completions.create(
+            model=OPENROUTER_MODEL,
             timeout=60,
-            response_format={"type": "json_object"},
+            max_tokens=3072,
+            reasoning_effort="low",
+            extra_body=OPENROUTER_ROUTE,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "due_diligence_brief",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "sections": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "heading": {"type": "string"},
+                                        "claims": {
+                                            "type": "array",
+                                            "items": citation_schema,
+                                        },
+                                    },
+                                    "required": ["heading", "claims"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["sections"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
             messages=[
                 {"role": "system", "content": (
                     "Write a concise financial due-diligence brief as JSON with key sections: "

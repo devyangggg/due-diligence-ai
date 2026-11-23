@@ -1,34 +1,34 @@
 # Due-diligence AI
 
-A single-user local application that builds a source-linked due-diligence brief from a company's latest SEC 10-K, Yahoo Finance market data, and Groq. The Python backend serves a FastAPI WebSocket and read-only run-history endpoints; the Next.js frontend shows progress, source excerpts, and past runs.
+A single-user local application that builds a source-linked due-diligence brief from a company's latest SEC 10-K, Yahoo Finance market data, and OpenRouter. The Python backend serves a FastAPI WebSocket and read-only run-history endpoints; the Next.js frontend shows progress, source excerpts, and past runs.
 
 ## Local setup
 
-Requires Python 3.13+, `uv`, Node.js, and a Groq API key for live analyses. Install dependencies:
+Requires Python 3.13+, `uv`, Node.js, and an OpenRouter API key for live analyses. Install dependencies:
 
 ```sh
 uv sync --group dev
 cd frontend && npm ci
 ```
 
-Set these environment variables (or place them in a local `.env`, which is ignored):
+Copy `.env.example` to the ignored `.env` manually only if you do not already have a `.env`; otherwise add the required settings to your existing file without overwriting its secrets:
 
 ```sh
-GROQ_API_KEY=your-key
+OPENROUTER_API_KEY=your-openrouter-key
 SEC_USER_AGENT="DueDiligenceAI your-contact@example.com"
 # Optional; defaults to sqlite+aiosqlite:///./due_diligence.db
 DATABASE_URL="sqlite+aiosqlite:///./due_diligence.db"
 ```
 
-The SEC requires a real identifying User-Agent with a contact email; replace the example with your own contact. A local `sentence-transformers/all-MiniLM-L6-v2` model is downloaded on the first analysis if it is not already cached. There is no hosted embedding API or separate vector database. Start the backend from the project root with `uv run uvicorn server:api --reload` and the frontend with `cd frontend && npm run dev`; open `http://localhost:3000`. Live analysis makes external SEC, Yahoo Finance, and Groq requests. Running the offline tests or benchmark does not.
+Use an OpenRouter key explicitly: `GROQ_API_KEY` and `OPENAI_API_KEY` are not substitutes or fallbacks. The SEC requires a real identifying User-Agent with a contact email; replace the example with your own contact. A local `sentence-transformers/all-MiniLM-L6-v2` model is downloaded on the first analysis if it is not already cached. There is no hosted embedding API or separate vector database. Start the backend from the project root with `uv run uvicorn server:api --reload` and the frontend with `cd frontend && npm run dev`; open `http://localhost:3000`. Live analysis makes external SEC, Yahoo Finance, and OpenRouter requests. Running the offline tests or benchmark does not.
 
-The current Groq model is `openai/gpt-oss-120b` (approved after the previous `llama-3.3-70b-versatile` model returned HTTP 404 for this account).
+The OpenRouter model is `openai/gpt-oss-120b`. Requests use strict JSON Schema with a per-request enum of permitted citation IDs; local citation validation still rejects unsupported IDs. Provider routing requires parameter support (`require_parameters=true`), disallows fallback providers (`allow_fallbacks=false`), and denies provider data collection (`data_collection=deny`). No implicit provider or API-key switching is configured. One fully live AAPL analysis completed after Yahoo Finance was configured to use Firefox impersonation; see the live smoke results below.
 
 ## Pipeline and API
 
 1. `data.SECClient` resolves the ticker to a CIK and checks SEC submissions for the latest 10-K accession. It selects the primary HTML filing, removes hidden/iXBRL markup, and extracts body Items 1, 1A, 7, and 8. Section boundaries skip repeated running page headers and table-of-contents entries; missing boundaries fail explicitly rather than silently swallowing neighboring sections.
-2. `retrieval.make_passages` preserves bounded excerpts and accession/item/index IDs. The local embedding model generates normalized passage vectors cached in SQLite by accession, model, and chunker version. For each item, focused questions retrieve their top two passages by cosine similarity; the results are deduplicated and capped at six passages before a single Groq extraction call. Only passages from that item enter the prompt. This is passage-level retrieval-augmented generation, not whole-document prompting or a semantic search across all filings.
-3. The LangGraph pipeline loads fundamentals and the filing, fans out into section summaries, market-risk calculation, and insider activity, then joins them for Groq synthesis. Filing claims must reference IDs in the selected evidence; unknown IDs fail validation. The final brief contains SEC links and a separate verbatim excerpt for each cited passage. The URL points to the filing, not an exact HTML anchor. The model's factual correctness still needs human review; valid citation IDs alone do not prove every assertion.
+2. `retrieval.make_passages` preserves bounded excerpts and accession/item/index IDs. The local embedding model generates normalized passage vectors cached in SQLite by accession, model, and chunker version. For each item, focused questions retrieve their top two passages by cosine similarity; the results are deduplicated and capped at six passages before a single OpenRouter extraction call. Only passages from that item enter the prompt. This is passage-level retrieval-augmented generation, not whole-document prompting or a semantic search across all filings.
+3. The LangGraph pipeline loads fundamentals and the filing, fans out into section summaries, market-risk calculation, and insider activity, then joins them for OpenRouter synthesis. Filing claims must reference IDs in the selected evidence; unknown IDs fail validation. The final brief contains SEC links and a separate verbatim excerpt for each cited passage. The URL points to the filing, not an exact HTML anchor. The model's factual correctness still needs human review; valid citation IDs alone do not prove every assertion.
 4. `storage.Store` uses async SQLAlchemy and SQLite (`PRAGMA user_version` migration) for filing/passage caches and runs. The latest SEC accession is refreshed on each new run before reusing cached content. A parser-version change reparses cached source text and invalidates its old passages/embeddings; model and chunker versions key the embedding cache. Existing version-1 SQLite files migrate in place. The frontend reads history from the backend, not browser localStorage. It shows up to 20 recent runs; the database retains the records.
 
 Connect to `ws://localhost:8000/test`, then send JSON `{"ticker":"AAPL"}`. The server emits per-node completion events `{"type":"stage","stage":"fundamentals|summary|risk|info|synthesis","status":"completed"}`, followed by `{"type":"final","run":{...}}` or `{"type":"error","run":{...},"message":"..."}`. Errors before run creation have `"run":null`. A run includes `id`, `ticker`, `accession`, `status`, `startedAt`, `finishedAt`, `finalBrief`, `citations` (`id`, `item`, `url`, `excerpt`), and `error`. The final brief arrives as a whole: **individual model tokens are not streamed**. `GET /runs` lists the 20 newest runs; `GET /runs/{id}` returns full run detail (404 if absent). The only accepted WebSocket ticker syntax is 1–10 uppercase alphanumeric/dot/hyphen characters after normalization.
@@ -43,22 +43,22 @@ uv run python -m scripts.evaluate_retrieval
 cd frontend && npm run build
 ```
 
-Tests use synthetic SEC-shaped fixtures and fake SEC/Yahoo/Groq/model responses, covering SEC 429 handling, heading boundaries, citation validation, graph joins, two simultaneously active WebSockets, disconnects, SQLite restarts, and cache invalidation. All 22 backend tests passed without credentials. Both benchmark scripts use the same invented four-item filing and Yahoo inputs, a controlled 2 ms delay on each of five fake model calls per run, and 21 completed runs (zero failed timed runs); their JSON includes raw per-stage timings and environment. The historical graph has no cache and returns mock plain text; the new graph has a cold first run followed by 20 warm SQLite-cache runs and mock citation-bearing JSON. They therefore **cannot establish a production speedup**. The local MiniLM retrieval check ranked the expected passage first for 4/4 hand-labeled synthetic questions (recall@1); that tiny invented dataset is not evidence of accuracy on real 10-Ks. No 30-minute manual baseline or real-world speedup has been measured.
+`uv run pytest -q` passed 25 credential-free backend tests (one dependency deprecation warning); `cd frontend && npm run build` passed compilation and TypeScript. The two offline benchmark scripts each timed 21 completed runs against the same invented SEC/Yahoo inputs, with five fake model calls per run delayed by 2 ms each; neither benchmark calls an external API. The historical graph has no cache and returns mock plain text. The current graph returns mock citation-bearing JSON and uses SQLite: one cold run, then 20 warm runs. Both scripts emit raw per-stage timings and environment details.
 
-| Offline mock workflow (Python 3.13.5, macOS 27.0.1 arm64) | Median wall time | p95 wall time |
-| --- | ---: | ---: |
-| Historical, 21 uncached runs | 13.864 ms | 14.538 ms |
-| Current, 1 cold + 20 warm runs | 8.979 ms | 9.287 ms |
+| Offline mock workflow (Python 3.13.5, macOS 27.2.1 arm64) | Cache state | Median run | p95 run |
+| --- | --- | ---: | ---: |
+| Historical graph, 21 runs | No cache | 14.301 ms | 16.262 ms |
+| Current graph, 21 runs | 1 cold + 20 warm SQLite runs | 9.048 ms | 9.531 ms |
 
-These are one local run of each harness, not comparable user-facing throughput figures. The historical summary-stage median was 9.932 ms and the current summary-stage median was 4.620 ms; all stages and individual runs are in the harness JSON. The actual Next.js dashboard was opened against the fake-backed FastAPI server: it rendered a completed ACME brief with an SEC excerpt, and the completed run remained selectable from history after reload. No live Groq response was checked.
+The median is the middle of 21 runs; p95 is the 20th-fastest run. **Do not interpret the lower current mock times as a production speedup:** the old graph is always uncached, the new graph is mostly warm, the generated response formats differ, and real network/model delays are replaced by fixed fake delays. No real-world speedup or roughly 30-minute manual baseline has been measured. An earlier four-question synthetic retrieval check found the expected passage first in 4/4 invented cases; that is not real-filing accuracy. The Next.js dashboard was previously opened with a fake-backed FastAPI server: it displayed a cited brief and restored it from backend history after reload.
 
-In a separate SEC-only smoke check, the 2026 Apple 10-K yielded four sections and 93 indexed passages. The focused Item 8 queries selected five distinct passages containing net-income, net-sales, and balance-sheet text; the selection was inspected with a fake Groq client, not a generated live brief. This demonstrates context coverage on one filing, not citation accuracy or model answer quality.
+In a separate SEC-only smoke check, the 2026 Apple 10-K yielded four sections and 93 indexed passages. The focused Item 8 queries selected five distinct passages containing net-income, net-sales, and balance-sheet text; the selection was inspected with a fake model client, not a generated live brief. This demonstrates context coverage on one filing, not citation accuracy or model answer quality.
 
 A separate non-paid Microsoft 10-K check exposed truncated sections caused by repeated running page headers. The parser now keeps each item through its next distinct SEC item, and the cached filing is reparsed on upgrade; a synthetic multi-page fixture covers the regression. These checks establish section coverage, not financial answer accuracy.
 
 ### Live retrieval evaluation
 
-Set a real `SEC_USER_AGENT` as in Local setup. Run `uv run python -m scripts.evaluate_retrieval_live` for pinned 2026 Apple/Microsoft filings; add `--dataset holdout` for Alphabet/Berkshire or `--dataset fresh` for Meta/Amazon. Each set has eight manually labeled source-text anchors, one per filing item. The script fails when an accession or anchor changes. It compares the frozen original MiniLM query/selection strategy, an **offline-only** MiniLM + BM25 experiment using the original queries, and the live diversified MiniLM questions with one first-choice passage per question before filling the remaining slots. All contexts remain capped at six passages per item; the four Groq section calls are unchanged.
+Set a real `SEC_USER_AGENT` as in Local setup. Run `uv run python -m scripts.evaluate_retrieval_live` for pinned 2026 Apple/Microsoft filings; add `--dataset holdout` for Alphabet/Berkshire or `--dataset fresh` for Meta/Amazon. Each set has eight manually labeled source-text anchors, one per filing item. The script fails when an accession or anchor changes. It compares the frozen original MiniLM query/selection strategy, an **offline-only** MiniLM + BM25 experiment using the original queries, and the live diversified MiniLM questions with one first-choice passage per question before filling the remaining slots. All contexts remain capped at six passages per item; the four OpenRouter section calls are unchanged.
 
 | Dataset | Strategy | Source passage in top 4 | Source passage in selected context |
 | --- | --- | ---: | ---: |
@@ -71,12 +71,32 @@ Set a real `SEC_USER_AGENT` as in Local setup. Run `uv run python -m scripts.eva
 | Meta + Amazon (fresh holdout) | Experimental hybrid | 6 / 8 | 4 / 8 |
 | Meta + Amazon (fresh holdout) | Live diversified | 6 / 8 | 5 / 8 |
 
-Hybrid ranking regressed on the initial two sets and was removed from the live agent; its ranker remains dev-only to reproduce the comparison. The initial holdout informed the decision to try question diversification, so **only Meta/Amazon is independent of that decision**. Diversification improved source-passage coverage by 2/8 on development filings and 1/8 on the fresh holdout; it increases local query embedding work, not Groq call count or passage cap. These tiny, manually selected samples are not representative accuracy estimates, financial fact-checks, or generated-answer scores. No Groq calls or paid APIs were used in these measurements.
+Hybrid ranking regressed on the initial two sets and was removed from the live agent; its ranker remains dev-only to reproduce the comparison. The initial holdout informed the decision to try question diversification, so **only Meta/Amazon is independent of that decision**. Diversification improved source-passage coverage by 2/8 on development filings and 1/8 on the fresh holdout; it increases local query embedding work, not OpenRouter call count or passage cap. These tiny, manually selected samples are not representative accuracy estimates, financial fact-checks, or generated-answer scores. No model calls or paid APIs were used in these measurements.
+The latest evaluation rechecked all six pinned SEC filings and reproduced the counts above.
 
-### Live Groq smoke result
+### Historical Groq live smoke result
 
-On 2026-11-16, the configured Groq key successfully listed models, and `openai/gpt-oss-120b` returned citation-bearing JSON for a minimal request. A full AAPL WebSocket analysis **did not complete**: one section response failed strict citation-ID validation; its run was correctly persisted as failed. A diagnostic run then returned three section responses with valid citation IDs, but Groq rejected another section request with HTTP 429 at the account's 8,000 tokens/minute limit (6,835 already used; 4,367 requested). There is no verified live final brief or live claim-accuracy result. Do not weaken citation validation to mask this failure.
+On 2026-11-16, the then-configured Groq key successfully listed models, and `openai/gpt-oss-120b` returned citation-bearing JSON for a minimal request. A full AAPL WebSocket analysis **did not complete**: one section response failed strict citation-ID validation; its run was correctly persisted as failed. A diagnostic run then returned three section responses with valid citation IDs, but Groq rejected another section request with HTTP 429 at the account's 8,000 tokens/minute limit (6,835 already used; 4,367 requested). These were Groq-era results, not an OpenRouter live test; no live Groq final brief or generated-claim accuracy was verified. Do not weaken citation validation to mask this failure.
+
+### OpenRouter live smoke result
+
+A small live request to `openai/gpt-oss-120b` returned a valid strict-schema claim with the supplied citation ID; OpenRouter reported 172 total tokens and a cost of $0.00001188 for that request. Before the Firefox change, a fully live AAPL WebSocket run failed before model generation because Yahoo Finance's default Chrome-impersonating `curl_cffi` session raised a TLS `invalid library` error. Its failed run was available through `GET /runs/{id}`.
+
+A separate diagnostic AAPL WebSocket run replaced only Yahoo fundamentals and insider transactions with deterministic fixtures. Real SEC filing retrieval/parsing (accession `0000320193-26-000026`), local embedding and passage selection, OpenRouter section extraction and synthesis, and SQLite run persistence remained active. It completed in 64.5 seconds with 15 citation records and a 6,944-character brief; `GET /runs/{id}` returned the completed run while the temporary test database existed. This verifies that isolated path, not live Yahoo integration, model factual accuracy, or production latency. No Yahoo code was changed.
+
+After switching all Yahoo Finance calls to a shared Firefox-impersonating session, a fully live AAPL WebSocket run completed using Yahoo prices, fundamentals, and insider transactions, the SEC filing, local passage retrieval, and OpenRouter generation. It took 76.8 seconds in this single local run; the completed brief had 19 citation records and 8,148 characters. `GET /runs/{id}` returned the completed run while the temporary test database existed. This is an integration smoke result, not a model factual-accuracy assessment or a representative latency benchmark.
+
+### Two-filing live evaluation
+
+In one sequential run against real Yahoo Finance, SEC filings, and OpenRouter with a fresh temporary SQLite database, both WebSocket analyses completed and `GET /runs/{id}` returned each completed record. Times are wall-clock measurements of these individual requests, **not** a latency distribution or a comparison with the offline mock benchmark.
+
+| Ticker | WebSocket duration | Claims with filing citations / all claims | Source links resolving to saved excerpts | Run |
+| --- | ---: | ---: | ---: | --- |
+| AAPL | 37.889 s | 25 / 36 | 30 / 30 | Completed, HTTP 200 on history lookup |
+| META | 28.063 s | 18 / 29 | 20 / 20 | Completed, HTTP 200 on history lookup |
+
+Source links resolve to allowed passage IDs, but **the generated claims are not reliably grounded**. In a manual spot-check, an Apple claim called $67,656 million the company's operating income, although its cited Item 8 table lists that as one segment and $123,216 million as the table total. Another Apple claim called $12,815 million lease liabilities; its cited table calls that right-of-use *assets* and lists $14,368 million of lease liabilities. A Meta claim described accelerating Reality Labs hardware adoption, but its cited excerpt describes sales efforts without an adoption trend. These examples demonstrate unsupported or misread claims, not an exhaustive error count or an accuracy percentage. Review any generated financial statement against the filing before use; valid citation IDs alone do not make it correct.
 
 ## Limits
 
-This is a single-instance, single-user local app with no authentication or per-user isolation. Do not deploy it publicly without making an access-control decision. SQLite and in-process cosine ranking fit one filing at a time, not a multi-instance search service. SEC HTML and model outputs vary; missing filing headings, insufficient evidence, rate limits, and upstream failures produce a failed run rather than a fabricated answer. The source-link validator checks passage IDs and does not replace financial fact-checking. First-run model download and live Groq calls require connectivity; the automated checks do not use paid APIs.
+This is a single-instance, single-user local app with no authentication or per-user isolation. Do not deploy it publicly without making an access-control decision. SQLite and in-process cosine ranking fit one filing at a time, not a multi-instance search service. SEC HTML and model outputs vary; missing filing headings, insufficient evidence, rate limits, and upstream failures produce a failed run rather than a fabricated answer. The source-link validator checks passage IDs and does not replace financial fact-checking. First-run model download and live OpenRouter calls require connectivity; the automated checks do not use paid APIs.

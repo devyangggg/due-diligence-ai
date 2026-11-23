@@ -21,7 +21,7 @@ from agent import AnalysisContext, app
 from storage import Store
 from scripts.benchmark_fixture import (
     INSIDER_TRANSACTIONS, MODEL_CALL_LATENCY_SECONDS, TICKER,
-    FixtureSEC, LatencyGroq, fake_vitals,
+    FixtureSEC, LatencyLLM, fake_vitals,
 )
 from tests.support import FakeEmbedder
 
@@ -39,9 +39,9 @@ async def measure(label, count):
         await store.migrate()
         sec = FixtureSEC()
         embedder = FakeEmbedder()
-        groq = LatencyGroq()
+        llm = LatencyLLM()
         with ThreadPoolExecutor(max_workers=3) as executor:
-            ctx = AnalysisContext(sec, store, embedder, groq, executor,
+            ctx = AnalysisContext(sec, store, embedder, llm, executor,
                                   asyncio.Semaphore(2), tuple(asyncio.Lock() for _ in range(64)))
             runs = []
             try:
@@ -72,7 +72,7 @@ async def measure(label, count):
         "cacheState": "SQLite: first run cold, remaining runs warm; historical graph has no cache",
         "comparison": "controlled mock workflow comparison only; not a production speedup",
         "runCount": count, "fetchCount": sec.fetches, "embeddingCalls": len(embedder.calls),
-        "groqCalls": groq.chat.completions.calls_with_latency,
+        "modelCalls": llm.chat.completions.calls_with_latency,
         "medianSeconds": statistics.median(durations),
         "p95Seconds": percentile(durations, 95),
         "warmMedianSeconds": statistics.median(warm),

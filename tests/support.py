@@ -44,11 +44,13 @@ class FakeEmbedder(LocalEmbedder):
 class FakeCompletions:
     def __init__(self, invalid_citation=False):
         self.calls = []
+        self.request_kwargs = []
         self.invalid_citation = invalid_citation
 
     async def create(self, *, messages, **kwargs):
         user = messages[-1]["content"]
         self.calls.append(user)
+        self.request_kwargs.append({"messages": messages, **kwargs})
         if user.startswith("Item:"):
             identifier = re.search(r"\[([^\]]+)]", user).group(1)
             if self.invalid_citation:
@@ -69,7 +71,7 @@ class FakeCompletions:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
 
-class FakeGroq:
+class FakeLLM:
     def __init__(self, invalid_citation=False):
         self.chat = SimpleNamespace(completions=FakeCompletions(invalid_citation))
 

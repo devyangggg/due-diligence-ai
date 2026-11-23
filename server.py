@@ -14,7 +14,7 @@ import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from agent import AnalysisContext, app
@@ -32,20 +32,27 @@ async def lifespan(api: FastAPI):
     http = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0), follow_redirects=True)
     store = Store(os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./due_diligence.db"))
     executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="finance")
+    llm = None
     try:
         await store.migrate()
-        key = os.getenv("GROQ_API_KEY")
+        key = os.getenv("OPENROUTER_API_KEY")
+        llm = AsyncOpenAI(
+            api_key=key, base_url="https://openrouter.ai/api/v1",
+            max_retries=2, timeout=60.0,
+        ) if key else None
         api.state.context = AnalysisContext(
             sec=SECClient(http, user_agent=os.getenv("SEC_USER_AGENT", "")),
             store=store,
             embedder=LocalEmbedder(),
-            groq=AsyncGroq(api_key=key, max_retries=2, timeout=60.0) if key else None,
+            llm=llm,
             executor=executor,
             model_limit=asyncio.Semaphore(2),
             index_locks=tuple(asyncio.Lock() for _ in range(64)),
         )
         yield
     finally:
+        if llm is not None:
+            await llm.close()
         executor.shutdown(wait=False, cancel_futures=True)
         await store.close()
         await http.aclose()
@@ -120,9 +127,9 @@ async def eval_model(websocket: WebSocket):
             await websocket.send_json({"type": "error", "run": None, "message": str(exc)})
             await websocket.close()
         return
-    if ctx.groq is None:
+    if ctx.llm is None:
         await websocket.send_json({
-            "type": "error", "run": None, "message": "GROQ_API_KEY is not configured"
+            "type": "error", "run": None, "message": "OPENROUTER_API_KEY is not configured"
         })
         await websocket.close()
         return

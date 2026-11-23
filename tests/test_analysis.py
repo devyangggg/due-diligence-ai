@@ -1,14 +1,19 @@
 """Offline graph, WebSocket and run-history behavior with fake upstreams."""
 
 import asyncio
+import json
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from threading import Event, Lock
 
 from bs4 import BeautifulSoup
+import httpx
 import numpy as np
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 
 import agent
 import data
@@ -16,7 +21,18 @@ from agent import AnalysisContext, app
 from retrieval import CHUNKER_VERSION, MODEL_VERSION, LocalEmbedder, Passage, make_passages
 from server import api
 from storage import Store
-from tests.support import FakeEmbedder, FakeGroq, FakeSEC, fake_vitals
+from tests.support import FakeEmbedder, FakeLLM, FakeSEC, fake_vitals
+
+
+def citation_enum(request):
+    schema = request["response_format"]
+    assert schema["type"] == "json_schema"
+    assert schema["json_schema"]["strict"] is True
+    provider = request.get("extra_body", request)["provider"]
+    assert provider["require_parameters"] is True
+    assert provider["allow_fallbacks"] is False
+    assert provider["data_collection"] == "deny"
+    return schema["json_schema"]["schema"]["properties"]
 
 
 def patch_finance(monkeypatch):
@@ -24,16 +40,49 @@ def patch_finance(monkeypatch):
     monkeypatch.setattr(agent, "_insider_transactions", lambda ticker: [{"insider": "Example"}])
 
 
+def test_yahoo_finance_uses_working_firefox_profile(monkeypatch):
+    def require_firefox(session):
+        if session.impersonate != "firefox":
+            raise ConnectionError("Yahoo TLS handshake failed")
+
+    def download(ticker, *, period, session):
+        require_firefox(session)
+        assert ticker == "AAPL" and period == "1y"
+        return pd.DataFrame({("Close", "AAPL"): [100.0, 102.0, 101.0]})
+
+    class Ticker:
+        def __init__(self, ticker, *, session):
+            require_firefox(session)
+            assert ticker == "AAPL"
+
+        @property
+        def info(self):
+            return {"trailingPE": 12.0, "sector": "Technology",
+                    "marketCap": 1_000_000, "beta": 1.2}
+
+        @property
+        def insider_transactions(self):
+            return pd.DataFrame([{"insider": "Example"}])
+
+    monkeypatch.setattr(data.fin, "download", download)
+    monkeypatch.setattr(data.fin, "Ticker", Ticker)
+    vitals = data.getVitals("AAPL")
+    assert vitals["sector"] == "Technology"
+    assert vitals["priceHist"] == [102.0, 101.0]
+    assert len(vitals["dailyReturns"]) == 2
+    assert agent._insider_transactions("AAPL") == [{"insider": "Example"}]
+
+
 @pytest.mark.asyncio
-async def test_graph_selects_filing_text_for_groq_and_reuses_passage_cache(tmp_path, monkeypatch):
+async def test_graph_selects_filing_text_for_model_and_reuses_passage_cache(tmp_path, monkeypatch):
     patch_finance(monkeypatch)
     store = Store(f"sqlite+aiosqlite:///{tmp_path / 'graph.db'}")
     await store.migrate()
     sec = FakeSEC()
     embedder = FakeEmbedder()
-    groq = FakeGroq()
+    llm = FakeLLM()
     with ThreadPoolExecutor(max_workers=3) as executor:
-        ctx = AnalysisContext(sec, store, embedder, groq, executor, asyncio.Semaphore(2),
+        ctx = AnalysisContext(sec, store, embedder, llm, executor, asyncio.Semaphore(2),
                               tuple(asyncio.Lock() for _ in range(64)))
         try:
             outputs = []
@@ -47,9 +96,25 @@ async def test_graph_selects_filing_text_for_groq_and_reuses_passage_cache(tmp_p
             result = await app.ainvoke({"ticker": "ACME"}, config={"configurable": {"context": ctx}})
             assert "## Financial Analysis" in result["final_output"]
             assert result["citations"][0]["excerpt"] in sec_source_text()
-            assert all("Passages:" in prompt for prompt in groq.chat.completions.calls[:4])
-            assert "industrial sensors for hospitals" in " ".join(groq.chat.completions.calls[:4])
-            assert "priceHist" not in " ".join(groq.chat.completions.calls[:4])
+            assert all("Passages:" in prompt for prompt in llm.chat.completions.calls[:4])
+            assert "industrial sensors for hospitals" in " ".join(llm.chat.completions.calls[:4])
+            assert "priceHist" not in " ".join(llm.chat.completions.calls[:4])
+            completions = llm.chat.completions
+            assert len(completions.request_kwargs) == 10
+            for prompt, request in zip(completions.calls[:4], completions.request_kwargs[:4]):
+                offered = set(re.findall(r"^\[([^\]]+)]", prompt, re.MULTILINE))
+                assert offered
+                claims = citation_enum(request)["claims"]["items"]
+                assert set(claims["properties"]["citations"]["items"]["enum"]) == offered
+            synthesis = completions.request_kwargs[4]
+            summary_ids = {id_ for claim in result["summary_claims"] for id_ in claim["citations"]}
+            assert summary_ids
+            prompt_ids = {id_ for claim in json.loads(synthesis["messages"][-1]["content"])["filing_claims"]
+                          for id_ in claim["citations"]}
+            assert prompt_ids == summary_ids
+            sections = citation_enum(synthesis)["sections"]["items"]
+            synth_claim = sections["properties"]["claims"]["items"]
+            assert set(synth_claim["properties"]["citations"]["items"]["enum"]) == summary_ids
             assert sec.fetches == 1
             assert sum(len(batch) > 1 for batch in embedder.calls) == 1
             sec.accession = "0000012345-27-000001"
@@ -82,21 +147,65 @@ async def test_financial_summary_retrieves_distinct_income_and_balance_evidence(
             return [vector(0, 1, 0)]
 
     store = Store(f"sqlite+aiosqlite:///{tmp_path / 'query-test.db'}")
-    groq = FakeGroq()
+    llm = FakeLLM()
     with ThreadPoolExecutor(max_workers=1) as executor:
-        ctx = AnalysisContext(FakeSEC(), store, TopicEmbedder(), groq, executor,
+        ctx = AnalysisContext(FakeSEC(), store, TopicEmbedder(), llm, executor,
                               asyncio.Semaphore(2), tuple(asyncio.Lock() for _ in range(64)))
         try:
             result = await agent.summary_agent(
                 {"passages": passages}, {"configurable": {"context": ctx}}
             )
-            prompt = groq.chat.completions.calls[0]
+            prompt = llm.chat.completions.calls[0]
             assert all(f"[{id_}]" in prompt for id_ in ("sales", "income", "balance"))
             assert "[unrelated]" not in prompt
             assert len(result["summary_claims"]) == 1
             assert result["summary_claims"][0]["citations"][0] in {"sales", "income", "balance"}
         finally:
             await store.close()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_client_serializes_strict_citation_request():
+    offered = [
+        Passage("offered-a", "a", "Item 1", 0, "Acme makes sensors."),
+        Passage("offered-b", "a", "Item 1", 1, "Acme serves hospitals."),
+    ]
+    captured = []
+
+    def respond(request):
+        assert request.method == "POST"
+        assert request.url.path == "/api/v1/chat/completions"
+        payload = json.loads(request.content)
+        captured.append(payload)
+        return httpx.Response(200, json={
+            "id": "offline-response", "object": "chat.completion", "created": 0,
+            "model": "openai/gpt-oss-120b",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant",
+                "content": json.dumps({"claims": [{"text": "Acme makes sensors.",
+                                                "citations": ["offered-a"]}]}),
+            }}],
+        })
+
+    class FixedEmbedder:
+        async def search(self, query, passages, item, k):
+            return offered if item == "Item 1" else []
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http_client:
+        llm = AsyncOpenAI(api_key="offline-placeholder",
+                          base_url="https://openrouter.ai/api/v1",
+                          http_client=http_client)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            ctx = AnalysisContext(FakeSEC(), None, FixedEmbedder(), llm, executor,
+                                  asyncio.Semaphore(2), tuple(asyncio.Lock() for _ in range(64)))
+            result = await agent.summary_agent(
+                {"passages": offered}, {"configurable": {"context": ctx}}
+            )
+    assert len(captured) == 1
+    assert captured[0]["model"] == "openai/gpt-oss-120b"
+    claims = citation_enum(captured[0])["claims"]["items"]
+    assert set(claims["properties"]["citations"]["items"]["enum"]) == {"offered-a", "offered-b"}
+    assert result["summary_claims"][0]["citations"] == ["offered-a"]
 
 
 @pytest.mark.asyncio
@@ -136,7 +245,7 @@ async def test_cached_old_parser_text_reindexes_without_refetch(tmp_path, monkey
              make_passages(ref.accession, {"Item 1": "truncated"})]
     await store.save_passages(ref.accession, stale, MODEL_VERSION, CHUNKER_VERSION)
     with ThreadPoolExecutor(max_workers=3) as executor:
-        ctx = AnalysisContext(sec, store, FakeEmbedder(), FakeGroq(), executor,
+        ctx = AnalysisContext(sec, store, FakeEmbedder(), FakeLLM(), executor,
                               asyncio.Semaphore(2), tuple(asyncio.Lock() for _ in range(64)))
         try:
             result = await app.ainvoke({"ticker": "ACME"},
@@ -164,11 +273,11 @@ def sec_source_text():
 def test_websocket_emits_stages_final_and_sql_history(tmp_path, monkeypatch):
     patch_finance(monkeypatch)
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'api.db'}")
-    monkeypatch.setenv("GROQ_API_KEY", "offline-test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "offline-test-key")
     with TestClient(api) as client:
         api.state.context.sec = FakeSEC()
         api.state.context.embedder = FakeEmbedder()
-        api.state.context.groq = FakeGroq()
+        api.state.context.llm = FakeLLM()
         with client.websocket_connect("/test") as websocket:
             websocket.send_json({"ticker": "ACME"})
             events = []
@@ -187,14 +296,29 @@ def test_websocket_emits_stages_final_and_sql_history(tmp_path, monkeypatch):
         assert client.get("/runs/missing").status_code == 404
 
 
+def test_websocket_requires_openrouter_key_even_with_groq_key(tmp_path, monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'missing-key.db'}")
+    monkeypatch.setenv("GROQ_API_KEY", "unused-offline-placeholder")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with TestClient(api) as client:
+        with client.websocket_connect("/test") as websocket:
+            websocket.send_json({"ticker": "ACME"})
+            event = websocket.receive_json()
+    assert event["type"] == "error"
+    assert "OPENROUTER_API_KEY" in event["message"]
+
+
 def test_websocket_rejects_invalid_ticker_and_persists_upstream_error(tmp_path, monkeypatch):
     patch_finance(monkeypatch)
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'errors.db'}")
-    monkeypatch.setenv("GROQ_API_KEY", "offline-test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "offline-test-key")
     with TestClient(api) as client:
         api.state.context.sec = FakeSEC()
         api.state.context.embedder = FakeEmbedder()
-        api.state.context.groq = FakeGroq(invalid_citation=True)
+        api.state.context.llm = FakeLLM(invalid_citation=True)
         with client.websocket_connect("/test") as websocket:
             websocket.send_json({"ticker": "@@@"})
             rejected = websocket.receive_json()
@@ -214,7 +338,7 @@ def test_websocket_rejects_invalid_ticker_and_persists_upstream_error(tmp_path, 
 def test_two_websockets_finish_independently_and_persist_history(tmp_path, monkeypatch):
     patch_finance(monkeypatch)
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'sockets.db'}")
-    monkeypatch.setenv("GROQ_API_KEY", "offline-test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "offline-test-key")
     first_fetch_started = Event()
     release_first = Event()
 
@@ -237,7 +361,7 @@ def test_two_websockets_finish_independently_and_persist_history(tmp_path, monke
     with TestClient(api) as client:
         api.state.context.sec = PausedFirstSEC()
         api.state.context.embedder = FakeEmbedder()
-        api.state.context.groq = FakeGroq()
+        api.state.context.llm = FakeLLM()
 
         def terminal_event(websocket):
             while True:
@@ -312,7 +436,7 @@ async def test_waiting_upstream_call_does_not_block_another_analysis(tmp_path, m
     store = Store(f"sqlite+aiosqlite:///{tmp_path / 'concurrent.db'}")
     await store.migrate()
     with ThreadPoolExecutor(max_workers=3) as executor:
-        ctx = AnalysisContext(SlowFirstSEC(), store, FakeEmbedder(), FakeGroq(),
+        ctx = AnalysisContext(SlowFirstSEC(), store, FakeEmbedder(), FakeLLM(),
                               executor, asyncio.Semaphore(2),
                               tuple(asyncio.Lock() for _ in range(64)))
         config = {"configurable": {"context": ctx}}
@@ -336,7 +460,7 @@ def test_client_disconnect_records_failed_run(tmp_path, monkeypatch):
 
     patch_finance(monkeypatch)
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'disconnect.db'}")
-    monkeypatch.setenv("GROQ_API_KEY", "offline-test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "offline-test-key")
 
     class WaitingSEC(FakeSEC):
         async def fetch_filing(self, ref):
@@ -346,7 +470,7 @@ def test_client_disconnect_records_failed_run(tmp_path, monkeypatch):
     with TestClient(api) as client:
         api.state.context.sec = WaitingSEC()
         api.state.context.embedder = FakeEmbedder()
-        api.state.context.groq = FakeGroq()
+        api.state.context.llm = FakeLLM()
         with client.websocket_connect("/test") as websocket:
             websocket.send_json({"ticker": "ACME"})
             for _ in range(100):

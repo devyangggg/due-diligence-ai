@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from data import Filing
-from tests.support import FakeGroq, FakeSEC, fake_vitals
+from tests.support import FakeLLM, FakeSEC, fake_vitals
 
 TICKER = "ACME"
 MODEL_CALL_LATENCY_SECONDS = 0.002
@@ -24,7 +24,7 @@ class FixtureSEC(FakeSEC):
         return Filing(ref, FILING_TEXT, SECTIONS.copy())
 
 
-class LatencyGroq(FakeGroq):
+class LatencyLLM(FakeLLM):
     def __init__(self):
         super().__init__()
         original_create = self.chat.completions.create
