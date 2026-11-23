@@ -609,6 +609,24 @@ body {
   margin: 4px 0;
 }
 
+.prose .source-link {
+  color: var(--accent-light);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prose .source-link:hover {
+  color: var(--accent);
+}
+
+.prose .source-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
 .prose strong {
   font-weight: 600;
   color: var(--text-primary);

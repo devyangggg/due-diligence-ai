@@ -22,9 +22,9 @@ export default function BriefView({ run, isRunning }: BriefViewProps) {
     );
   }
 
-  const citations = new Map(run!.citations.map((citation) => [citation.id, citation]));
+  const citationNumbers = new Map(run!.citations.map((citation, index) => [citation.id, index + 1] as const));
   const citedIds = Array.from(run!.finalBrief!.matchAll(/\[([A-Za-z0-9][A-Za-z0-9._:-]*)\]/g), (match) => match[1]);
-  const unknownIds = [...new Set(citedIds.filter((id) => !citations.has(id) && /[-_:]/.test(id)))];
+  const unknownIds = [...new Set(citedIds.filter((id) => !citationNumbers.has(id) && /[-_:]/.test(id)))];
 
   return (
     <div className="brief-container">
@@ -34,23 +34,41 @@ export default function BriefView({ run, isRunning }: BriefViewProps) {
       </div>
       <div className="brief-content prose">
         <ReactMarkdown components={{
-          a: ({ href, children, ...props }) => {
+          a: ({ href, children }) => {
             const id = href?.startsWith('#') ? decodeURIComponent(href.slice(1)) : null;
-            if (id && citations.has(id)) return <a href={`#citation-${id}`} {...props}>{children}</a>;
+            if (id && citationNumbers.has(id)) {
+              return <a className="source-link" href={`#citation-${id}`}>Source {citationNumbers.get(id)}</a>;
+            }
             if (id) return <span title="Unknown citation ID">[Unverified citation: {id}]</span>;
-            return <a href={href} {...props}>{children}</a>;
+
+            const sourceId = typeof children === 'string' && children.startsWith('source ')
+              ? children.slice('source '.length)
+              : null;
+            const number = sourceId && citationNumbers.get(sourceId);
+            if (number && href === run!.citations[number - 1].url) {
+              const citation = run!.citations[number - 1];
+              return (
+                <a className="source-link" href={href} target="_blank" rel="noopener noreferrer"
+                  aria-label={`Source ${number}: ${citation.item} in SEC filing`}>
+                  Source {number}
+                </a>
+              );
+            }
+            return <a href={href}>{children}</a>;
           },
         }}>{run!.finalBrief!.replace(/\[([A-Za-z0-9][A-Za-z0-9._:-]*)\]/g, (match, id: string) =>
-          citations.has(id) ? `[${id}](#${id})` : match
+          citationNumbers.has(id) ? `[${id}](#${id})` : match
         )}</ReactMarkdown>
         {unknownIds.length > 0 && <p>Unverified citation IDs: {unknownIds.join(', ')}</p>}
         {run!.citations.length > 0 && (
           <section aria-label="SEC filing evidence">
             <h3>Source evidence</h3>
             <ul>
-              {run!.citations.map((citation) => (
+              {run!.citations.map((citation, index) => (
                 <li key={citation.id} id={`citation-${citation.id}`}>
-                  <a href={citation.url} target="_blank" rel="noopener noreferrer">{citation.id} — {citation.item} (SEC filing)</a>
+                  <a className="source-link" href={citation.url} target="_blank" rel="noopener noreferrer">
+                    Source {index + 1} — {citation.item} (SEC filing)
+                  </a>
                   <blockquote>{citation.excerpt}</blockquote>
                 </li>
               ))}
