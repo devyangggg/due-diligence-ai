@@ -1,5 +1,4 @@
 export type AgentName = 'fundamentals' | 'summary' | 'risk' | 'info' | 'synthesis';
-
 export type AgentStatus = 'idle' | 'pending' | 'running' | 'complete' | 'error';
 
 export interface AgentState {
@@ -8,19 +7,29 @@ export interface AgentState {
   data: unknown;
 }
 
-export interface AnalysisResult {
-  ticker: string;
-  timestamp: string;
-  agents: Record<AgentName, AgentState>;
-  finalBrief: string | null;
+export interface Citation {
+  id: string;
+  item: string;
+  url: string;
+  excerpt: string;
 }
 
-export interface HistoryEntry {
+export interface Run {
   id: string;
   ticker: string;
-  timestamp: string;
-  result: AnalysisResult;
+  accession: string | null;
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
+  startedAt: string;
+  finishedAt: string | null;
+  finalBrief: string | null;
+  citations: Citation[];
+  error: string | null;
 }
+
+export type AnalysisEvent =
+  | { type: 'stage'; stage: AgentName; status: 'completed' }
+  | { type: 'final'; run: Run }
+  | { type: 'error'; run: Run; message: string };
 
 export const AGENT_CONFIG: { name: AgentName; label: string }[] = [
   { name: 'fundamentals', label: 'Fundamentals Analysis' },

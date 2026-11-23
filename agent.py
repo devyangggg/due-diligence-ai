@@ -1,219 +1,317 @@
-from typing import TypedDict
-import data
+"""LangGraph analysis pipeline; dependencies are supplied per request, not at import."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from statistics import stdev
+from typing import Any, TypedDict
+
 import yfinance as fin
-from langgraph.graph import StateGraph, START, END
-from dotenv import load_dotenv
-import os
-from groq import Groq
-import pandas as pd
+from groq import AsyncGroq
+from langgraph.graph import END, START, StateGraph
+from langchain_core.runnables import RunnableConfig
 
-load_dotenv()
+import data
+from retrieval import LocalEmbedder, Passage, make_passages, MODEL_VERSION, CHUNKER_VERSION
+from storage import Store
 
-api_key = os.getenv("GROQ_API_KEY")
 
-client = Groq(api_key=api_key)
+SECTIONS = {
+    "Item 1": (
+        "What are the company's products, services, and revenue segments?",
+        "Which geographic markets and customer groups does the company serve?",
+        "What customer support, warranty, or subscription services are offered?",
+        "What cloud platforms or other technology services are offered?",
+    ),
+    "Item 1A": (
+        "What risks could materially affect sales or financial performance?",
+        "What supply, regulatory, or competitive risks does the filing describe?",
+        "What privacy, data protection, or cybersecurity risks could affect customers?",
+    ),
+    "Item 7": (
+        "How did net sales and revenue change from the prior fiscal year?",
+        "What changed in gross margin and operating costs?",
+        "How did operating income or segment operating earnings change?",
+        "What outlook or forward guidance does management explicitly provide?",
+    ),
+    "Item 8": (
+        "What are consolidated net sales and net income for the fiscal year?",
+        "What do the income statement and gross margin figures report?",
+        "What cash, assets, liabilities, or debt appear on the balance sheet?",
+    ),
+}
+GROQ_MODEL = "openai/gpt-oss-120b"
 
-class AgentState(TypedDict):
+
+@dataclass
+class AnalysisContext:
+    sec: data.SECClient
+    store: Store
+    embedder: LocalEmbedder
+    groq: AsyncGroq | None
+    executor: ThreadPoolExecutor
+    model_limit: asyncio.Semaphore
+    index_locks: tuple[asyncio.Lock, ...]
+
+
+class AgentState(TypedDict, total=False):
     ticker: str
-    fundamentals: dict
-    ten_k_summary:str
-    risk_info: dict
-    info_collected: dict
-    all_agent_done:list
+    fundamentals: dict[str, Any]
+    filing_ref: data.FilingRef
+    passages: list[Passage]
+    risk_info: dict[str, float]
+    info_collected: dict[str, Any]
+    summary_claims: list[dict[str, Any]]
+    ten_k_summary: str
     final_output: str
+    citations: list[dict[str, str]]
 
 
-def fundamentals_agent(state:AgentState):
-    fundamentals_dict = data.getVitals(state['ticker'])
-    status = state['all_agent_done']
-    ten_k_text = data.get_latest_10k(state['ticker'])
-    slices = data.slice_10k_specific_items(ten_k_text)
+def _context(config: RunnableConfig) -> AnalysisContext:
+    return config["configurable"]["context"]
 
-    return {
-        "fundamentals" : {
-            **fundamentals_dict,
-            "ten_k": {
-                "item 1":slices['Item 1'],
-                "item 1a":slices['Item 1A'],
-                "item 7":slices['Item 7'],
-                "item 8":slices['Item 8']
-            }
-        },
-        #"all_agent_done" : status.append('Fundamentals agent done')
+
+async def _finance_call(ctx: AnalysisContext, function, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(ctx.executor, function, *args)
+
+
+async def fundamentals_agent(state: AgentState, config: RunnableConfig) -> dict:
+    ctx = _context(config)
+    ticker = state["ticker"]
+    vitals_task = asyncio.create_task(_finance_call(ctx, data.getVitals, ticker))
+    try:
+        ref = await ctx.sec.resolve_filing(ticker)
+        cached = await ctx.store.get_filing(ref.accession)
+        if cached is None:
+            filing = await ctx.sec.fetch_filing(ref)
+            await ctx.store.save_filing(
+                ref, filing.text, filing.sections, data.PARSER_VERSION
+            )
+        lock_key = hash((ref.accession, MODEL_VERSION, CHUNKER_VERSION))
+        async with ctx.index_locks[lock_key % len(ctx.index_locks)]:
+            # A second run may have populated or upgraded this accession while
+            # the first was fetching it. Re-read before invalidating passages.
+            cached = await ctx.store.get_filing(ref.accession)
+            if cached["parser_version"] != data.PARSER_VERSION:
+                sections = data.slice_10k_specific_items(cached["text"])
+                await ctx.store.update_sections(ref.accession, sections, data.PARSER_VERSION)
+            else:
+                sections = cached["sections"]
+
+            passages = await ctx.store.get_passages(ref.accession, MODEL_VERSION, CHUNKER_VERSION)
+            if not passages:
+                passages = make_passages(ref.accession, sections)
+                vectors = await ctx.embedder.embed([passage.text for passage in passages])
+                if len(vectors) != len(passages):
+                    raise ValueError("Embedding count differs from passage count")
+                passages = [
+                    replace(passage, embedding=vector)
+                    for passage, vector in zip(passages, vectors)
+                ]
+                await ctx.store.save_passages(ref.accession, passages, MODEL_VERSION, CHUNKER_VERSION)
+        vitals = await vitals_task
+        return {"fundamentals": vitals, "filing_ref": ref, "passages": passages}
+    finally:
+        if not vitals_task.done():
+            vitals_task.cancel()
+            await asyncio.gather(vitals_task, return_exceptions=True)
+
+
+def _parse_claims(raw: str | None, allowed: set[str]) -> list[dict[str, Any]]:
+    if not raw:
+        raise ValueError("Empty model response")
+    result = json.loads(raw)
+    claims = result.get("claims")
+    if not isinstance(claims, list):
+        raise ValueError("Model response lacks claims")
+    validated = []
+    for claim in claims:
+        if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+            raise ValueError("Invalid model claim")
+        text = claim["text"].strip()
+        ids = claim.get("citations")
+        if not text or not isinstance(ids, list) or not ids or any(
+            not isinstance(identifier, str) or identifier not in allowed for identifier in ids
+        ):
+            raise ValueError("Model claim has missing or invalid source citations")
+        validated.append({"text": text, "citations": list(dict.fromkeys(ids))})
+    return validated
+
+
+async def select_passages(
+    embedder: LocalEmbedder, passages: list[Passage], item: str,
+    questions: tuple[str, ...],
+) -> dict[str, Passage]:
+    """Reserve one evidence slot per question before filling remaining slots."""
+    ranked = [await embedder.search(question, passages, item, k=2) for question in questions]
+    selected: dict[str, Passage] = {}
+    for rank in range(2):
+        for results in ranked:
+            if len(selected) == 6:
+                return selected
+            if len(results) > rank:
+                passage = results[rank]
+                selected.setdefault(passage.id, passage)
+    return selected
+
+
+async def summary_agent(state: AgentState, config: RunnableConfig) -> dict:
+    ctx = _context(config)
+
+    async def summarize(item: str, questions: tuple[str, ...]) -> tuple[str, list[dict[str, Any]]]:
+        selected = await select_passages(ctx.embedder, state["passages"], item, questions)
+        if not selected:
+            return item, []
+        allowed = set(selected)
+        evidence = "\n\n".join(f"[{passage.id}] {passage.text}" for passage in selected.values())
+        async with ctx.model_limit:
+            response = await ctx.groq.chat.completions.create(
+                model=GROQ_MODEL,
+                timeout=60,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": (
+                        "You extract facts ONLY from the supplied 10-K passages. Return a JSON object "
+                        "with key claims: an array of {text, citations}. Each factual claim needs at least "
+                        "one exact passage ID in citations. Never invent an ID or a fact. If there is no "
+                        "answer in the supplied passages, return {\"claims\":[]}. Maximum five concise claims."
+                    )},
+                    {"role": "user", "content": (
+                        f"Item: {item}\nQuestions:\n- " + "\n- ".join(questions)
+                        + f"\nPassages:\n{evidence}"
+                    )},
+                ],
+            )
+        return item, _parse_claims(response.choices[0].message.content, allowed)
+
+    results = await asyncio.gather(*(summarize(item, queries) for item, queries in SECTIONS.items()))
+    claims = [dict(claim, item=item) for item, section in results for claim in section]
+    compiled = "\n".join(
+        f"{claim['item']}: {claim['text']} " + " ".join(f"[[{id_}]]" for id_ in claim["citations"])
+        for claim in claims
+    ) or "Insufficient filing evidence in selected passages."
+    return {"summary_claims": claims, "ten_k_summary": compiled}
+
+
+async def risk_agent(state: AgentState) -> dict:
+    fundam = state["fundamentals"]
+    prices = fundam["priceHist"]
+    returns = fundam["dailyReturns"]
+    if len(prices) < 2 or len(returns) < 2:
+        raise ValueError("Not enough price observations to calculate risk")
+    maximum = prices[0]
+    drawdown = 0.0
+    for price in prices:
+        maximum = max(maximum, price)
+        drawdown = min(drawdown, (price - maximum) / maximum)
+    return {"risk_info": {
+        "volatility": stdev(returns),
+        "beta": fundam["beta"],
+        "max_drawdown": drawdown,
+    }}
+
+
+def _insider_transactions(ticker: str) -> list[dict]:
+    table = fin.Ticker(ticker).insider_transactions
+    if table is None or table.empty:
+        return []
+    return table.astype(str).head(20).to_dict(orient="records")
+
+
+async def info_agent(state: AgentState, config: RunnableConfig) -> dict:
+    transactions = await _finance_call(_context(config), _insider_transactions, state["ticker"])
+    return {"info_collected": {"insider_trans": transactions}}
+
+
+def _parse_brief(raw: str | None, evidence: dict[str, Passage], url: str) -> tuple[str, list[dict[str, str]]]:
+    if not raw:
+        raise ValueError("Empty synthesis response")
+    result = json.loads(raw)
+    sections = result.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise ValueError("Synthesis response lacks sections")
+    lines: list[str] = []
+    used: dict[str, Passage] = {}
+    for section in sections:
+        if not isinstance(section, dict) or not isinstance(section.get("heading"), str):
+            raise ValueError("Invalid synthesis heading")
+        claims = section.get("claims")
+        if not isinstance(claims, list):
+            raise ValueError("Invalid synthesis claims")
+        lines.append(f"## {section['heading'].strip()}")
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                raise ValueError("Invalid synthesis claim")
+            text = claim["text"].strip()
+            ids = claim.get("citations")
+            if not text or not isinstance(ids, list) or any(
+                not isinstance(identifier, str) or identifier not in evidence for identifier in ids
+            ):
+                raise ValueError("Synthesis refers to missing source evidence")
+            for identifier in ids:
+                used[identifier] = evidence[identifier]
+            links = " ".join(f"[source {identifier}]({url})" for identifier in dict.fromkeys(ids))
+            lines.append(f"- {text}" + (f" {links}" if links else ""))
+        lines.append("")
+    if evidence and not used:
+        raise ValueError("Synthesis omitted available filing citations")
+    citations = [{"id": id_, "item": passage.item, "url": url, "excerpt": passage.text}
+                 for id_, passage in used.items()]
+    return "\n".join(lines).strip(), citations
+
+
+async def synth_agent(state: AgentState, config: RunnableConfig) -> dict:
+    ctx = _context(config)
+    fundam = state["fundamentals"]
+    ref = state["filing_ref"]
+    claims = state["summary_claims"]
+    used_ids = {id_ for claim in claims for id_ in claim["citations"]}
+    evidence = {passage.id: passage for passage in state["passages"] if passage.id in used_ids}
+    prompt = {
+        "ticker": state["ticker"],
+        "sector": fundam["sector"],
+        "peRatio": fundam["peRatio"],
+        "marketCap": fundam["marketCap"],
+        "risk": state["risk_info"],
+        "insider_transactions": state["info_collected"]["insider_trans"],
+        "filing_claims": claims,
     }
-
-
-def risk_agent(state:AgentState):
-    fundam = state['fundamentals']
-    price_hist = pd.Series(fundam['priceHist'])  # convert list back to series so pandas math methods work
-    daily_returns = pd.Series(fundam['dailyReturns'])
-
-    status = state['all_agent_done']
-
-    volatility = daily_returns.std()
-    beta = fundam['beta']
-    rolling_max = price_hist.expanding().max()
-    drawdown = (price_hist - rolling_max) / rolling_max
-    max_drawdown = float(drawdown.min())
-
-    return {
-        "risk_info":{
-            "volatility" : float(volatility),
-            "beta": beta,
-            "max_drawdown" : max_drawdown
-        },
-        #"all_agent_done" : status.append('Risk agent done')
-    }
-
-
-def info_agent(state:AgentState):
-    ticker = state['ticker']
-    status = state['all_agent_done']
-    insider_trans = fin.Ticker(ticker).insider_transactions.astype(str)
-    return {
-        "info_collected":{
-            "insider_trans" : insider_trans.to_dict(orient='records')
-        },
-        #"all_agent_done" : status.append('Info agent done')
-    }
-
-#----------------------------
-
-#----------------------------
-# i want to make a summarising agent that extracts the imp info from the 10k and addes it to the state
-
-def summary_agent(state:AgentState):
-    """Summarise the 10k financial form and keep only useful information"""
-
-    chunks_dict = state["fundamentals"]['ten_k']
-
-    status = state['all_agent_done']
-
-    section_prompts = {
-    "item 1": "Extract a concise Business Overview from this section. Cover: what the company does, key products and services, revenue segments, and geographic markets.",  # business context
-    
-    "item 1a": "Extract the top 5 most material risk factors from this section. One sentence per risk, as close to verbatim as possible. Focus on risks that could materially impact financial performance.",  # risk context
-    
-    "item 7": "Extract key insights from Management Discussion and Analysis. Cover: revenue trends, margin commentary, management's outlook, and any forward guidance explicitly stated.",  # management context
-    
-    "item 8": "Extract key financial highlights from this section. Cover: total revenue, net income, gross margin, YoY growth rates, and any significant balance sheet items mentioned."  # financial context
-    }
-
-    system_prompt = """
-    You are a senior financial analyst extracting key information from a specific section of a 10-K annual report.
-
-    Extract ONLY what is explicitly stated in the text provided. Do not infer, speculate, or add context not present in the filing.
-
-    Rules:
-    - If the information requested is not found in the text, write "Insufficient data in extract"
-    - Do not add analysis or opinion — extraction only
-    - No legal boilerplate, exhibit lists, or SEC filing metadata
-    - Be concise — maximum 150 words per response
-    - Do not repeat the section name or instructions back
-    """ 
-
-    summaries = {}
-
-    for section_name, chunk_text in chunks_dict.items():
-        if chunk_text is None:
-            summaries[section_name] = "Insufficient data"  
-            continue
-
-
-        user_prompt = f"{section_prompts[section_name]} Section text: {chunk_text[:30000]}"  #capped becuase of groq limits :((
-
-
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+    async with ctx.model_limit:
+        response = await ctx.groq.chat.completions.create(
+            model=GROQ_MODEL,
+            timeout=60,
+            response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
+                {"role": "system", "content": (
+                    "Write a concise financial due-diligence brief as JSON with key sections: "
+                    "an array of {heading, claims:[{text,citations}]}. Include Company Snapshot, "
+                    "Financial Analysis, Risk Assessment, Insider Activity, Bull Case, Bear Case, "
+                    "and Recommendation (Buy/Hold/Sell with rationale). For every fact taken from "
+                    "filing_claims, include its existing passage IDs in citations; market metrics and "
+                    "insider facts may have empty citations. Do not add facts not in the input, invent "
+                    "citations, or infer unsupported details; say when evidence is insufficient. "
+                    "Keep numerical units correct: volatility is percent daily returns, drawdown a fraction."
+                )},
+                {"role": "user", "content": json.dumps(prompt, default=str)},
+            ],
         )
-        summaries[section_name] = response.choices[0].message.content
-
-    compiled = "\n\n".join([f"{k}:\n{v}" for k, v in summaries.items()])
-
-    return {"ten_k_summary": compiled,
-            #"all_agent_done" : status.append('Summary agent done')
-            }  
-    
-
-
-def synth_agent(state:AgentState):
-    """Make a summary kind of something from the data in the state and write to final_output"""
-
-    user_prompt = f"""
-    Ticker: {state['ticker']}
-    Sector: {state['fundamentals']['sector']}
-    P/E Ratio: {state['fundamentals']['peRatio']}
-    Beta: {state['risk_info']['beta']}
-    Volatility: {state['risk_info']['volatility']}
-    Max Drawdown: {state['risk_info']['max_drawdown']}
-    Insider Transactions: {state['info_collected']['insider_trans']}
-    10-K Summary: {state['ten_k_summary']}
-    """
-
-    system_prompt = """
-    You are a senior financial analyst at a PE firm. You are concise, direct, and data-driven. No filler sentences.
-
-    Given company data, produce a due diligence brief in exactly this structure:
-
-    1. Company Snapshot — ticker, sector, key metrics formatted correctly (P/E as ratio, volatility as %, drawdown as %)
-    2. Financial Analysis — what the numbers indicate about the company's health
-    3. Risk Assessment — beta, volatility, drawdown interpreted in context
-    4. Insider Activity — what the trading patterns suggest
-    5. Bull Case — 2-3 specific reasons to invest
-    6. Bear Case — 2-3 specific reasons to avoid
-    7. Recommendation — Buy / Hold / Sell with one sentence justification
-
-    If the 10-K extract is insufficient to draw conclusions, say so explicitly. Do not fabricate insights.
-    """
-
-    status = state['all_agent_done']
-
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-    )
-
-    #result = response.choices[0].message.content
-
-    return {
-    "final_output": response.choices[0].message.content,
-    #"all_agent_done" : status.append('Synth agent done')
-    }
-
-# test_state = {"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""}
-# print(fundamentals_agent(test_state))
+    brief, citations = _parse_brief(response.choices[0].message.content, evidence, ref.url)
+    return {"final_output": brief, "citations": citations}
 
 
 graph = StateGraph(AgentState)
-
-graph.add_node("fundamentals_agent",fundamentals_agent)
-graph.add_node("risk_agent",risk_agent)
-graph.add_node("info_agent",info_agent)
-graph.add_node("synth_agent",synth_agent)
-graph.add_node("summary_agent",summary_agent)
-
+graph.add_node("fundamentals_agent", fundamentals_agent)
+graph.add_node("summary_agent", summary_agent)
+graph.add_node("risk_agent", risk_agent)
+graph.add_node("info_agent", info_agent)
+graph.add_node("synth_agent", synth_agent)
 graph.add_edge(START, "fundamentals_agent")
-
-graph.add_edge("fundamentals_agent", "summary_agent")
-graph.add_edge("fundamentals_agent", "risk_agent")
-graph.add_edge("fundamentals_agent", "info_agent")
-
-graph.add_edge("risk_agent", "synth_agent")
-graph.add_edge("info_agent", "synth_agent")
-graph.add_edge("summary_agent", "synth_agent")
-
+for node in ("summary_agent", "risk_agent", "info_agent"):
+    graph.add_edge("fundamentals_agent", node)
+    graph.add_edge(node, "synth_agent")
 graph.add_edge("synth_agent", END)
-
-
 app = graph.compile()
-
-# result = app.invoke({"ticker": "AAPL", "fundamentals": {}, "risk_info": {}, "info_collected": {}, "all_agent_done": [], "final_output": ""})
-
-# print(result['final_output'])

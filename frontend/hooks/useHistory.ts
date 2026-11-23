@@ -1,52 +1,40 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import type { HistoryEntry, AnalysisResult } from '@/types';
+import type { Run } from '@/types';
 
-const STORAGE_KEY = 'dd-history';
+const RUNS_URL = 'http://localhost:8000/runs';
 
 export function useHistory() {
-  const [entries, setEntries] = useState<HistoryEntry[]>([]);
+  const [entries, setEntries] = useState<Run[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
-  // Load from localStorage on mount
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
+  const reload = useCallback(async () => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        setEntries(JSON.parse(stored));
-      }
+      const response = await fetch(RUNS_URL, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const runs: Run[] = await response.json();
+      setEntries(runs);
+      setError(null);
     } catch {
-      // Corrupted data — start fresh
-      localStorage.removeItem(STORAGE_KEY);
+      setError('Could not load analysis history from the server.');
     }
   }, []);
 
-  // Persist to localStorage whenever entries change
-  const persist = useCallback((updated: HistoryEntry[]) => {
-    setEntries(updated);
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+  useEffect(() => { void reload(); }, [reload]);
+
+  const getRun = useCallback(async (id: string): Promise<Run | null> => {
+    try {
+      const response = await fetch(`${RUNS_URL}/${encodeURIComponent(id)}`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const run: Run = await response.json();
+      setError(null);
+      return run;
+    } catch {
+      setError('Could not load this analysis from the server.');
+      return null;
     }
   }, []);
 
-  const addEntry = useCallback(
-    (result: AnalysisResult) => {
-      const entry: HistoryEntry = {
-        id: `${result.ticker}-${Date.now()}`,
-        ticker: result.ticker,
-        timestamp: result.timestamp,
-        result,
-      };
-      // Prepend new entry, keep max 20
-      persist([entry, ...entries].slice(0, 20));
-    },
-    [entries, persist]
-  );
-
-  const clearHistory = useCallback(() => {
-    persist([]);
-  }, [persist]);
-
-  return { entries, addEntry, clearHistory };
+  return { entries, error, reload, getRun };
 }

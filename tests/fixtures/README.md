@@ -1,0 +1,1 @@
+These SEC-shaped HTML and JSON fixtures are entirely synthetic examples authored for offline tests. ACME and its numerical figures are invented; they are not copied SEC data or real financial results.

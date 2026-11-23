@@ -10,3 +10,10 @@ wheels/
 .venv
 .env
 
+
+# Local implementation plan
+/plan.md
+
+# Local database and test artifacts
+/due_diligence.db*
+/.pytest_cache/

@@ -1,15 +1,14 @@
 'use client';
 
-import type { HistoryEntry } from '@/types';
+import type { Run } from '@/types';
 
 interface SidebarProps {
-  entries: HistoryEntry[];
+  entries: Run[];
   activeId: string | null;
   isOpen: boolean;
   onClose: () => void;
-  onSelect: (entry: HistoryEntry) => void;
+  onSelect: (entry: Run) => void;
   onNewAnalysis: () => void;
-  onClearHistory: () => void;
 }
 
 export default function Sidebar({
@@ -19,9 +18,8 @@ export default function Sidebar({
   onClose,
   onSelect,
   onNewAnalysis,
-  onClearHistory,
 }: SidebarProps) {
-  const handleSelect = (entry: HistoryEntry) => {
+  const handleSelect = (entry: Run) => {
     onSelect(entry);
     onClose();
   };
@@ -90,22 +88,13 @@ export default function Sidebar({
         <div className="sidebar-section">
           <div className="sidebar-section-header">
             <span className="sidebar-section-label">History</span>
-            {entries.length > 0 && (
-              <button
-                className="clear-history-btn"
-                onClick={onClearHistory}
-              >
-                Clear
-              </button>
-            )}
           </div>
-
           {entries.length === 0 ? (
             <p className="sidebar-empty">No analyses yet</p>
           ) : (
             <ul className="history-list">
               {entries.map((entry) => {
-                const date = new Date(entry.timestamp);
+                const date = new Date(entry.startedAt);
                 const formatted = date.toLocaleDateString('en-US', {
                   month: 'short',
                   day: 'numeric',
@@ -121,7 +110,7 @@ export default function Sidebar({
                       }`}
                       onClick={() => handleSelect(entry)}
                     >
-                      <span className="history-ticker">{entry.ticker}</span>
+                      <span className="history-ticker">{entry.ticker} · {entry.status}</span>
                       <span className="history-time">{formatted}</span>
                     </button>
                   </li>
